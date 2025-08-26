@@ -4,11 +4,16 @@ import pickle
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import requests
+import gdown
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React Native
 
-# Load the model
+file_id = '1qUf0S8NpiuQhmyIOt3l8rD7vmSXETomz'
+url = f'https://drive.google.com/uc?id={file_id}'
+gdown.download(url, 'recommender_model.pkl', quiet=False)
+
 with open('recommender_model.pkl', 'rb') as f:
     df, vectorizer, cosine_sim, features = pickle.load(f)
 
