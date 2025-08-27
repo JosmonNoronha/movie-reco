@@ -4,18 +4,19 @@ import pickle
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
-import requests
 import gdown
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React Native
 
-file_id = '1qUf0S8NpiuQhmyIOt3l8rD7vmSXETomz'
+# Download the model from Google Drive
+file_id = '1qUf0S8NpiuQhmyIOt3l8rD7vmSXETomz'  
 url = f'https://drive.google.com/uc?id={file_id}'
 gdown.download(url, 'recommender_model.pkl', quiet=False)
 
+# Load the model (df, vectorizer, features only)
 with open('recommender_model.pkl', 'rb') as f:
-    df, vectorizer, cosine_sim, features = pickle.load(f)
+    df, vectorizer, features = pickle.load(f)
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
@@ -33,8 +34,13 @@ def recommend():
         popular = df.sort_values('release_year', ascending=False).head(top_n)['title'].tolist()
         return jsonify({'recommendations': popular})
     
+    # Compute user profile vector
     user_vector = np.mean(features[user_indices].toarray(), axis=0).reshape(1, -1)
+    
+    # Compute similarities on-demand
     sim_scores = cosine_similarity(user_vector, features)[0]
+    
+    # Sort and filter recommendations
     sim_indices = np.argsort(-sim_scores)
     recommendations = []
     for idx in sim_indices:
