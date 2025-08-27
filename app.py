@@ -50,7 +50,10 @@ def recommend():
                 'title': title,
                 'type': df.iloc[idx]['type'],
                 'genres': df.iloc[idx]['listed_in'],
-                'description': df.iloc[idx]['description'][:100] + '...'
+                'description': df.iloc[idx]['description'][:100] + '...',
+                'release_year': str(df.iloc[idx]['release_year']),  # Add year for better OMDb matching
+                'director': df.iloc[idx]['director'],
+                'cast': df.iloc[idx]['cast']
             })
         if len(recommendations) == top_n:
             break
