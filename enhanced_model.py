@@ -1,13 +1,14 @@
-# hybrid_model.py - Netflix + MovieLens integration
+# hybrid_model.py - Netflix + MovieLens integration (FIXED)
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 import pickle
 import re
+import os
 from fuzzywuzzy import fuzz
 
 def load_and_merge_datasets():
-    """Load both datasets and merge them intelligently"""
+    """Load both datasets and create a truly hybrid dataset"""
     
     print("Loading Netflix dataset...")
     netflix_df = pd.read_csv('netflix_titles.csv')
@@ -15,6 +16,7 @@ def load_and_merge_datasets():
     print("Loading MovieLens datasets...")
     ratings_df = pd.read_csv('ml-latest-small/ratings.csv')
     movies_df = pd.read_csv('ml-latest-small/movies.csv')
+    tags_df = pd.read_csv('ml-latest-small/tags.csv') if os.path.exists('ml-latest-small/tags.csv') else None
     
     # Process MovieLens data
     print("Processing MovieLens ratings...")
@@ -26,20 +28,32 @@ def load_and_merge_datasets():
     # Merge with movies metadata
     ml_movies = movies_df.merge(movie_stats, on='movieId', how='left')
     
+    # Add tags if available
+    if tags_df is not None:
+        print("Processing MovieLens tags...")
+        movie_tags = tags_df.groupby('movieId')['tag'].apply(lambda x: ', '.join(x.unique())).reset_index()
+        ml_movies = ml_movies.merge(movie_tags, on='movieId', how='left')
+    else:
+        ml_movies['tag'] = ''
+    
     # Clean titles for matching
     netflix_df['clean_title'] = netflix_df['title'].str.lower().str.strip()
     ml_movies['year'] = ml_movies['title'].str.extract(r'\((\d{4})\)$').astype(float)
     ml_movies['clean_title'] = ml_movies['title'].str.replace(r'\s*\(\d{4}\)$', '', regex=True).str.lower().str.strip()
     
-    # Smart title matching using fuzzy matching
-    print("Matching titles between datasets...")
+    # STEP 1: Match existing Netflix titles with MovieLens data
+    print("Matching Netflix titles with MovieLens data...")
     netflix_df['ml_avg_rating'] = np.nan
     netflix_df['ml_rating_count'] = np.nan
     netflix_df['ml_rating_std'] = np.nan
     netflix_df['ml_genres'] = ''
+    netflix_df['ml_tags'] = ''
     netflix_df['data_source'] = 'netflix_only'
+    netflix_df['movieId'] = np.nan
     
+    matched_movie_ids = set()
     matched_count = 0
+    
     for idx, netflix_row in netflix_df.iterrows():
         netflix_title = netflix_row['clean_title']
         netflix_year = netflix_row['release_year']
@@ -75,11 +89,107 @@ def load_and_merge_datasets():
             netflix_df.at[idx, 'ml_rating_count'] = best_match['ml_rating_count'] 
             netflix_df.at[idx, 'ml_rating_std'] = best_match['ml_rating_std']
             netflix_df.at[idx, 'ml_genres'] = best_match['genres']
+            netflix_df.at[idx, 'ml_tags'] = best_match.get('tag', '')
             netflix_df.at[idx, 'data_source'] = 'hybrid'
+            netflix_df.at[idx, 'movieId'] = best_match['movieId']
+            matched_movie_ids.add(best_match['movieId'])
             matched_count += 1
     
-    print(f"Successfully matched {matched_count} titles between datasets")
-    return netflix_df, ratings_df, ml_movies
+    print(f"Successfully matched {matched_count} Netflix titles with MovieLens data")
+    
+    # STEP 2: Add MovieLens-only titles to create truly hybrid dataset
+    print("Adding MovieLens-only titles...")
+    
+    # Filter out already matched movies and low-quality entries
+    unmatched_ml = ml_movies[
+        (~ml_movies['movieId'].isin(matched_movie_ids)) &
+        (ml_movies['ml_rating_count'] >= 10) &  # At least 10 ratings
+        (ml_movies['ml_avg_rating'] >= 3.0)     # Decent rating
+    ].copy()
+    
+    print(f"Found {len(unmatched_ml)} high-quality MovieLens-only titles")
+    
+    # Convert MovieLens titles to Netflix format
+    movielens_as_netflix = []
+    
+    for _, ml_row in unmatched_ml.iterrows():
+        # Generate synthetic Netflix-style data for MovieLens titles
+        title = ml_row['title'].replace(f" ({int(ml_row['year'])})", "") if pd.notna(ml_row['year']) else ml_row['title']
+        
+        # Determine content type from genres
+        genres_lower = str(ml_row['genres']).lower()
+        content_type = 'TV Show' if any(tv_indicator in genres_lower for tv_indicator in ['tv', 'series']) else 'Movie'
+        
+        # Create synthetic description from genres and tags
+        description_parts = []
+        if pd.notna(ml_row['genres']) and ml_row['genres']:
+            description_parts.append(f"A {ml_row['genres'].lower().replace('|', ', ')} ")
+        
+        if pd.notna(ml_row.get('tag', '')) and ml_row.get('tag', ''):
+            tags = str(ml_row['tag']).split(', ')[:3]  # Top 3 tags
+            if tags:
+                description_parts.append(f"featuring themes of {', '.join(tags).lower()}")
+        
+        if not description_parts:
+            description_parts.append("A compelling story")
+        
+        description = ''.join(description_parts).strip()
+        if not description.endswith('.'):
+            description += '.'
+        
+        # Map MovieLens genres to Netflix format
+        netflix_genres = ml_row['genres'].replace('|', ', ') if pd.notna(ml_row['genres']) else ''
+        
+        netflix_row = {
+            'show_id': f"ml_{ml_row['movieId']}",
+            'type': content_type,
+            'title': title,
+            'director': '',  # MovieLens doesn't have director info
+            'cast': '',      # MovieLens doesn't have cast info
+            'country': '',   # MovieLens doesn't have country info
+            'date_added': '', # MovieLens doesn't have date added
+            'release_year': int(ml_row['year']) if pd.notna(ml_row['year']) else np.nan,
+            'rating': '',    # MovieLens doesn't have content rating
+            'duration': '',  # MovieLens doesn't have duration
+            'listed_in': netflix_genres,
+            'description': description,
+            'clean_title': ml_row['clean_title'],
+            'ml_avg_rating': ml_row['ml_avg_rating'],
+            'ml_rating_count': ml_row['ml_rating_count'],
+            'ml_rating_std': ml_row['ml_rating_std'],
+            'ml_genres': ml_row['genres'],
+            'ml_tags': ml_row.get('tag', ''),
+            'data_source': 'movielens_only',
+            'movieId': ml_row['movieId']
+        }
+        
+        movielens_as_netflix.append(netflix_row)
+    
+    # Convert to DataFrame and combine
+    if movielens_as_netflix:
+        ml_netflix_df = pd.DataFrame(movielens_as_netflix)
+        
+        # Ensure all columns exist in both DataFrames
+        all_columns = set(netflix_df.columns) | set(ml_netflix_df.columns)
+        
+        for col in all_columns:
+            if col not in netflix_df.columns:
+                netflix_df[col] = np.nan if col in ['ml_avg_rating', 'ml_rating_count', 'ml_rating_std', 'movieId'] else ''
+            if col not in ml_netflix_df.columns:
+                ml_netflix_df[col] = np.nan if col in ['ml_avg_rating', 'ml_rating_count', 'ml_rating_std', 'movieId'] else ''
+        
+        # Combine datasets
+        hybrid_df = pd.concat([netflix_df, ml_netflix_df], ignore_index=True)
+        print(f"Created hybrid dataset with {len(hybrid_df)} total titles:")
+        print(f"  - Netflix-only: {len(hybrid_df[hybrid_df['data_source'] == 'netflix_only'])}")
+        print(f"  - Hybrid (Netflix + MovieLens): {len(hybrid_df[hybrid_df['data_source'] == 'hybrid'])}")
+        print(f"  - MovieLens-only: {len(hybrid_df[hybrid_df['data_source'] == 'movielens_only'])}")
+        
+    else:
+        hybrid_df = netflix_df
+        print("No additional MovieLens titles added")
+    
+    return hybrid_df, ratings_df, ml_movies
 
 def create_hybrid_features(df):
     """Enhanced feature creation using both datasets"""
@@ -208,22 +318,24 @@ def create_hybrid_features(df):
         'coming_of_age': ['growing up', 'adolescent', 'first love', 'graduation']
     }
     
-    def extract_themes(text, genre_text="", ml_genres=""):
-        text_lower = str(text).lower() + ' ' + str(genre_text).lower() + ' ' + str(ml_genres).lower()
+    def extract_themes(text, genre_text="", ml_genres="", ml_tags=""):
+        combined_text = ' '.join([str(text), str(genre_text), str(ml_genres), str(ml_tags)]).lower()
         features = []
         
         for category, keywords in theme_keywords.items():
-            matches = sum(1 for keyword in keywords if keyword in text_lower)
+            matches = sum(1 for keyword in keywords if keyword in combined_text)
             if matches > 0:
                 features.extend([category] * min(matches, 2))
         
         return ' '.join(features)
     
-    # Extract themes using both Netflix and MovieLens genres
-    df['content_themes'] = df.apply(lambda x: extract_themes(x['description'], x['listed_in'], x['ml_genres']), axis=1)
+    # Extract themes using all available data
+    df['content_themes'] = df.apply(lambda x: extract_themes(
+        x['description'], x['listed_in'], x['ml_genres'], x.get('ml_tags', '')
+    ), axis=1)
     
     # MOOD & TONE ANALYSIS
-    def extract_mood(description):
+    def extract_mood(description, tags=""):
         mood_keywords = {
             'dark_serious': ['dark', 'gritty', 'intense', 'brutal', 'harsh', 'violent'],
             'light_hearted': ['light', 'fun', 'cheerful', 'upbeat', 'feel-good', 'heartwarming'],
@@ -232,16 +344,16 @@ def create_hybrid_features(df):
             'humorous': ['funny', 'hilarious', 'comedy', 'witty', 'amusing', 'laugh']
         }
         
-        desc_lower = str(description).lower()
+        combined_text = str(description).lower() + ' ' + str(tags).lower()
         moods = []
         
         for mood, keywords in mood_keywords.items():
-            if any(keyword in desc_lower for keyword in keywords):
+            if any(keyword in combined_text for keyword in keywords):
                 moods.append(mood)
         
         return ' '.join(moods)
     
-    df['content_mood'] = df['description'].apply(extract_mood)
+    df['content_mood'] = df.apply(lambda x: extract_mood(x['description'], x.get('ml_tags', '')), axis=1)
     
     # SMART CAST & DIRECTOR PROCESSING
     def extract_talent_profile(director_str, cast_str):
@@ -273,7 +385,7 @@ def create_hybrid_features(df):
     
     # ENHANCED GENRE PROCESSING (Netflix + MovieLens)
     def process_hybrid_genres(netflix_genres, ml_genres):
-        all_genres = str(netflix_genres).lower() + ' ' + str(ml_genres).lower()
+        all_genres = str(netflix_genres).lower() + ' ' + str(ml_genres).lower().replace('|', ' ')
         processed = []
         
         major_genres = {
@@ -289,7 +401,9 @@ def create_hybrid_features(df):
             'documentary': 'documentary_content',
             'animation': 'animation_content',
             'adventure': 'adventure_content',
-            'musical': 'musical_content'
+            'musical': 'musical_content',
+            'western': 'western_content',
+            'war': 'war_content'
         }
         
         for genre_key, genre_value in major_genres.items():
@@ -324,11 +438,18 @@ def create_hybrid_features(df):
     
     df['era_type'] = df.apply(get_content_era_type, axis=1)
     
-    # Add data reliability indicator
-    df['reliability'] = df['data_source'].apply(lambda x: 'verified_data ' if x == 'hybrid' else 'netflix_data ')
+    # Add data reliability and source information
+    def get_reliability_and_source(row):
+        if row['data_source'] == 'hybrid':
+            return 'verified_hybrid_data ', 'Netflix + MovieLens'
+        elif row['data_source'] == 'movielens_only':
+            return 'verified_ml_data ', 'MovieLens'
+        else:
+            return 'netflix_data ', 'Netflix'
     
-    # Set source information
-    df['source'] = df.apply(lambda x: 'Netflix + MovieLens' if x['data_source'] == 'hybrid' else 'Netflix', axis=1)
+    df[['reliability', 'source']] = df.apply(
+        lambda x: pd.Series(get_reliability_and_source(x)), axis=1
+    )
     
     # ENHANCED FEATURE SOUP
     df['soup'] = (
@@ -353,6 +474,9 @@ def create_hybrid_features(df):
         # Data reliability - 1x
         df['reliability'] +
         
+        # MovieLens tags (when available) - 1x
+        df.get('ml_tags', pd.Series([''] * len(df))).apply(lambda x: str(x).lower().replace(',', ' ') + ' ') +
+        
         # Clean description - 1x
         df['description'].apply(lambda x: re.sub(r'[^\w\s]', ' ', str(x).lower()))
     )
@@ -364,24 +488,37 @@ def create_universal_features(df):
     return create_hybrid_features(df)
 
 # Main execution
-netflix_df, ratings_df, ml_movies = load_and_merge_datasets()
+import os
 
-print("Creating hybrid features...")
-df = create_hybrid_features(netflix_df)
+# Check if files exist
+required_files = ['netflix_titles.csv', 'ml-latest-small/ratings.csv', 'ml-latest-small/movies.csv']
+missing_files = [f for f in required_files if not os.path.exists(f)]
+
+if missing_files:
+    print(f"Error: Missing required files: {missing_files}")
+    print("Please ensure you have:")
+    print("1. netflix_titles.csv in the current directory")
+    print("2. ml-latest-small/ folder with ratings.csv and movies.csv")
+    exit(1)
+
+hybrid_df, ratings_df, ml_movies = load_and_merge_datasets()
+
+print("Creating enhanced hybrid features...")
+df = create_hybrid_features(hybrid_df)
 
 print("Hybrid vectorization...")
 vectorizer = TfidfVectorizer(
     stop_words='english',
-    max_features=12000,
+    max_features=15000,  # Increased for more features
     ngram_range=(1, 2),
-    min_df=3,
+    min_df=2,  # Lowered to capture MovieLens-specific terms
     max_df=0.85,
     sublinear_tf=True
 )
 
 features = vectorizer.fit_transform(df['soup'])
 
-print("Saving hybrid model...")
+print("Saving enhanced hybrid model...")
 model_data = {
     'df': df,
     'vectorizer': vectorizer, 
@@ -389,21 +526,39 @@ model_data = {
     'movielens_data': {
         'ratings': ratings_df,
         'movies': ml_movies
-    }
+    },
+    'model_version': 'hybrid_v2.0'
 }
 
 with open('balanced_recommender_model.pkl', 'wb') as f:
     pickle.dump(model_data, f)
 
-print(f"Hybrid model created!")
-print(f"Dataset size: {len(df)} titles")
+print(f"Enhanced hybrid model created!")
+print(f"Total dataset size: {len(df)} titles")
 print(f"Feature dimensions: {features.shape}")
-print(f"Hybrid titles (with real ratings): {len(df[df['data_source'] == 'hybrid'])}")
-print(f"Netflix-only titles: {len(df[df['data_source'] == 'netflix_only'])}")
+print("\nDataset breakdown:")
+print(f"  Netflix-only titles: {len(df[df['data_source'] == 'netflix_only'])}")
+print(f"  Hybrid titles (Netflix + MovieLens): {len(df[df['data_source'] == 'hybrid'])}")
+print(f"  MovieLens-only titles: {len(df[df['data_source'] == 'movielens_only'])}")
 
-# Test across different genres
+# Test across different sources
+print("\nSource distribution:")
+for source in df['source'].unique():
+    count = len(df[df['source'] == source])
+    avg_rating = df[df['source'] == source]['avg_rating'].mean()
+    print(f"  {source}: {count} titles (avg rating: {avg_rating:.2f})")
+
+# Test across different genres with source info
+print("\nGenre analysis with sources:")
 test_genres = ['Crime', 'Comedy', 'Romance', 'Horror', 'Sci-Fi', 'Action']
 for genre in test_genres:
-    count = len(df[df['listed_in'].str.contains(genre, case=False, na=False)])
-    hybrid_count = len(df[(df['listed_in'].str.contains(genre, case=False, na=False)) & (df['data_source'] == 'hybrid')])
-    print(f"{genre} shows: {count} total ({hybrid_count} with real ratings)")
+    genre_mask = df['listed_in'].str.contains(genre, case=False, na=False) | df['ml_genres'].str.contains(genre, case=False, na=False)
+    total_count = len(df[genre_mask])
+    netflix_count = len(df[genre_mask & (df['source'] == 'Netflix')])
+    hybrid_count = len(df[genre_mask & (df['source'] == 'Netflix + MovieLens')])
+    ml_count = len(df[genre_mask & (df['source'] == 'MovieLens')])
+    
+    print(f"  {genre}: {total_count} total (Netflix: {netflix_count}, Hybrid: {hybrid_count}, MovieLens: {ml_count})")
+
+print(f"\nModel saved as 'balanced_recommender_model.pkl'")
+print("The model now includes both Netflix and MovieLens titles!")
