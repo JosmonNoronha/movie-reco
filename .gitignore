@@ -2,3 +2,4 @@ recommender_env/
 __pycache__/
 *.pyc
 recommender_model.pkl
+balanced_recommender_model.pkl
