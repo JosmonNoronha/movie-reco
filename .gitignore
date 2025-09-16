@@ -20,7 +20,7 @@ model_cache_optimized.pkl
 # Database files (optional - see note below)
 
 *.sqlite3
-recommendations.db
+
 
 # Data files (large datasets)
 netflix_titles.csv   
