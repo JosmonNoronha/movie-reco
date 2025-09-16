@@ -1,308 +1,279 @@
-# hybrid_app.py - Netflix + MovieLens API (FIXED)
+# database_hybrid_app.py - SQLite Database Version (SUPER FAST)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import sqlite3
 import pickle
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 import os
-import gdown
+import json
+from functools import lru_cache
+import logging
+from contextlib import closing
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-def load_model():
-    try:
-        file_id = '13yjX735n0Ddwd7r3YselhP71Z-XVo4Pt'  # Update with new file ID
-        url = f'https://drive.google.com/uc?id={file_id}'
-        
-        if not os.path.exists('balanced_recommender_model.pkl'):
-            print("Downloading hybrid model...")
-            gdown.download(url, 'balanced_recommender_model.pkl', quiet=False)
-        
-        with open('balanced_recommender_model.pkl', 'rb') as f:
-            model_data = pickle.load(f)
-            
-        # Handle both old and new model formats
-        if isinstance(model_data, dict):
-            return model_data['df'], model_data['vectorizer'], model_data['features']
-        else:
-            # Old format compatibility
-            return model_data
-    except:
-        with open('balanced_recommender_model.pkl', 'rb') as f:
-            model_data = pickle.load(f)
-            if isinstance(model_data, dict):
-                return model_data['df'], model_data['vectorizer'], model_data['features']
-            else:
-                return model_data
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-df, vectorizer, features = load_model()
+# Global variables
+vectorizer = None
+db_path = 'recommendations.db'
+connection_pool = threading.local()
 
-def compute_hybrid_similarity(user_vector, features, df, user_indices):
-    """Enhanced similarity using hybrid data"""
-    
-    content_sim = cosine_similarity(user_vector, features)[0]
-    
-    # Analyze user preferences from their selected titles
-    user_profile = {
-        'primary_genres': [],
-        'themes': [],
-        'avg_rating': 0,
-        'content_type': 'mixed',
-        'mood_preference': [],
-        'prefers_verified': False,
-        'prefers_movielens': False,
-        'source_preference': 'mixed'
-    }
-    
-    verified_count = 0
-    movielens_count = 0
-    
-    for idx in user_indices:
-        row = df.iloc[idx]
-        
-        # Count data sources user likes
-        if row.get('data_source') == 'hybrid':
-            verified_count += 1
-        elif row.get('data_source') == 'movielens_only':
-            movielens_count += 1
-        
-        # Extract preferences
-        genres = str(row['listed_in']).lower().split(',')
-        ml_genres = str(row.get('ml_genres', '')).lower().split('|')
-        all_genres = genres + ml_genres
-        user_profile['primary_genres'].extend([g.strip() for g in all_genres if g.strip()])
-        
-        themes = str(row.get('content_themes', '')).split()
-        user_profile['themes'].extend(themes)
-        
-        user_profile['avg_rating'] += row.get('avg_rating', 0)
-        
-        if row['type'] == 'TV Show':
-            user_profile['content_type'] = 'series'
-        elif user_profile['content_type'] != 'series':
-            user_profile['content_type'] = 'movies'
-        
-        moods = str(row.get('content_mood', '')).split()
-        user_profile['mood_preference'].extend(moods)
-    
-    # Determine user's data source preferences
-    total_selections = len(user_indices)
-    user_profile['prefers_verified'] = verified_count > total_selections * 0.3
-    user_profile['prefers_movielens'] = movielens_count > total_selections * 0.3
-    
-    if verified_count + movielens_count > total_selections * 0.6:
-        user_profile['source_preference'] = 'quality_data'
-    elif movielens_count > verified_count:
-        user_profile['source_preference'] = 'movielens'
-    elif verified_count > 0:
-        user_profile['source_preference'] = 'hybrid'
-    else:
-        user_profile['source_preference'] = 'netflix'
-    
-    # Normalize preferences
-    user_profile['avg_rating'] /= len(user_indices)
-    user_profile['primary_genres'] = list(set(user_profile['primary_genres']))[:8]
-    user_profile['themes'] = list(set(user_profile['themes']))[:10]
-    user_profile['mood_preference'] = list(set(user_profile['mood_preference']))[:5]
-    
-    # Calculate enhanced bonuses
-    bonuses = []
-    
-    for idx, row in df.iterrows():
-        total_bonus = 0
-        
-        # DATA SOURCE BONUS (25% max)
-        if user_profile['source_preference'] == 'quality_data':
-            if row.get('data_source') == 'movielens_only' and row.get('ml_rating_count', 0) >= 50:
-                total_bonus += 0.25  # Strong preference for well-rated MovieLens titles
-            elif row.get('data_source') == 'hybrid' and row.get('ml_rating_count', 0) >= 30:
-                total_bonus += 0.20  # Good hybrid data
-            elif row.get('data_source') == 'hybrid':
-                total_bonus += 0.15
-        elif user_profile['source_preference'] == 'movielens':
-            if row.get('data_source') == 'movielens_only':
-                total_bonus += 0.20
-            elif row.get('data_source') == 'hybrid':
-                total_bonus += 0.10
-        elif user_profile['source_preference'] == 'hybrid':
-            if row.get('data_source') == 'hybrid':
-                total_bonus += 0.15
-            elif row.get('data_source') == 'movielens_only':
-                total_bonus += 0.10
-        
-        # GENRE MATCHING BONUS (20% max)
-        row_genres = (str(row['listed_in']) + '|' + str(row.get('ml_genres', ''))).lower()
-        genre_matches = sum(0.025 for user_genre in user_profile['primary_genres'] 
-                          if user_genre in row_genres)
-        total_bonus += min(0.20, genre_matches)
-        
-        # THEME MATCHING BONUS (15% max)
-        row_themes = str(row.get('content_themes', '')).split()
-        theme_matches = sum(0.015 for user_theme in user_profile['themes'] 
-                          if user_theme in row_themes)
-        total_bonus += min(0.15, theme_matches)
-        
-        # QUALITY PREFERENCE BONUS (15% max)
-        if user_profile['avg_rating'] > 3.5:
-            item_rating = row.get('avg_rating', 0)
-            # Enhanced for verified data
-            if row.get('data_source') in ['hybrid', 'movielens_only'] and pd.notna(row.get('ml_rating_std')):
-                if item_rating >= 4.2 and row.get('ml_rating_std', 1.0) < 0.8:
-                    total_bonus += 0.18  # Consistent high quality
-                elif item_rating >= 3.8:
-                    total_bonus += 0.12
-            else:
-                if item_rating >= 4.2:
-                    total_bonus += 0.15
-                elif item_rating >= 3.8:
-                    total_bonus += 0.10
-                elif item_rating >= 3.5:
-                    total_bonus += 0.05
-        
-        # CONTENT TYPE PREFERENCE (10% max)
-        if user_profile['content_type'] == 'series' and row['type'] == 'TV Show':
-            total_bonus += 0.10
-        elif user_profile['content_type'] == 'movies' and row['type'] == 'Movie':
-            total_bonus += 0.10
-        
-        # MOOD MATCHING BONUS (10% max)
-        row_moods = str(row.get('content_mood', '')).split()
-        mood_matches = sum(0.02 for user_mood in user_profile['mood_preference'] 
-                         if user_mood in row_moods)
-        total_bonus += min(0.10, mood_matches)
-        
-        # RATING COUNT BONUS (5% max) - Prefer well-rated content
-        rating_count = row.get('ml_rating_count', row.get('rating_count', 0))
-        if rating_count >= 100:
-            total_bonus += 0.05
-        elif rating_count >= 50:
-            total_bonus += 0.03
-        elif rating_count >= 20:
-            total_bonus += 0.01
-        
-        bonuses.append(total_bonus)
-    
-    # Combine content similarity with enhanced bonuses
-    final_scores = content_sim + np.array(bonuses)
-    
-    return final_scores
+def get_db_connection():
+    """Get thread-local database connection"""
+    if not hasattr(connection_pool, 'connection'):
+        connection_pool.connection = sqlite3.connect(db_path, check_same_thread=False)
+        connection_pool.connection.row_factory = sqlite3.Row  # Enable dict-like access
+    return connection_pool.connection
 
-def filter_universal_recommendations(df, sim_scores, user_indices, user_titles, top_n):
-    """Enhanced filtering with true hybrid data support"""
-    
-    sim_indices = np.argsort(-sim_scores)
-    recommendations = []
-    seen_titles = {title.lower().strip() for title in user_titles}
-    
-    # Diversity tracking
-    genre_count = {}
-    mood_count = {}
-    source_count = {'Netflix': 0, 'Netflix + MovieLens': 0, 'MovieLens': 0}
-    
-    # Dynamic quality thresholds based on data source
-    quality_thresholds = {
-        'netflix_only': 3.2,
-        'hybrid': 3.0,
-        'movielens_only': 3.0
-    }
-    
-    for idx in sim_indices:
-        if len(recommendations) >= top_n:
-            break
-            
-        row = df.iloc[idx]
-        title = row['title']
-        
-        if not title or title.lower().strip() in seen_titles:
-            continue
-        
-        # Enhanced quality filter based on data source
-        item_rating = row.get('avg_rating', 0)
-        data_source = row.get('data_source', 'netflix_only')
-        min_rating = quality_thresholds.get(data_source, 3.2)
-        
-        if data_source in ['hybrid', 'movielens_only']:
-            # Higher standards for verified data but more lenient entry
-            if item_rating < min_rating or (row.get('ml_rating_count', 0) < 5):
-                continue
+def load_vectorizer():
+    """Load vectorizer for text processing"""
+    global vectorizer
+    if vectorizer is None:
+        if os.path.exists('vectorizer_only.pkl'):
+            with open('vectorizer_only.pkl', 'rb') as f:
+                vectorizer = pickle.load(f)
+            logger.info("Vectorizer loaded")
         else:
-            # Standard threshold for Netflix-only
-            if item_rating < min_rating:
-                continue
-        
-        # Similarity threshold
-        if sim_scores[idx] < 0.03:  # Slightly lowered for more variety
-            continue
-        
-        # Enhanced diversity controls
-        primary_genre = str(row['listed_in']).split(',')[0].strip() if row['listed_in'] else \
-                       str(row.get('ml_genres', '')).split('|')[0].strip() if row.get('ml_genres') else 'Unknown'
-        
-        max_genre_count = max(2, int(top_n * 0.4))
-        if genre_count.get(primary_genre, 0) >= max_genre_count:
-            continue
-        
-        # Source diversity - ensure mix of sources
-        source = row.get('source', 'Netflix')
-        max_source_count = max(3, int(top_n * 0.7))  # Allow up to 70% from one source
-        if source_count.get(source, 0) >= max_source_count:
-            continue
-        
-        primary_mood = str(row.get('content_mood', '')).split()[0] if row.get('content_mood') else 'neutral'
-        if mood_count.get(primary_mood, 0) >= max(2, int(top_n * 0.5)):
-            continue
-        
-        # Update tracking
-        genre_count[primary_genre] = genre_count.get(primary_genre, 0) + 1
-        mood_count[primary_mood] = mood_count.get(primary_mood, 0) + 1
-        source_count[source] = source_count.get(source, 0) + 1
-        seen_titles.add(title.lower().strip())
-        
-        # Enhanced recommendation object with safe NaN handling
-        ml_count = row.get('ml_rating_count', np.nan)
-        regular_count = row.get('rating_count', np.nan)
-        
-        if pd.notna(ml_count):
-            rating_count = int(ml_count)
-        elif pd.notna(regular_count):
-            rating_count = int(regular_count)
-        else:
-            rating_count = 0
-        
-        rec = {
-            'title': title,
+            logger.warning("Vectorizer not found - text-based similarity disabled")
+    return vectorizer
+
+def check_database():
+    """Check if database exists and has data"""
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database {db_path} not found. Run convert_to_database.py first.")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM movies")
+    movie_count = cursor.fetchone()[0]
+    
+    if movie_count == 0:
+        raise ValueError("Database is empty. Run convert_to_database.py first.")
+    
+    logger.info(f"Database ready with {movie_count} movies")
+
+@lru_cache(maxsize=500)
+def search_movies_by_title(title_query):
+    """Fast cached title search"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    title_clean = title_query.lower().strip()
+    
+    # Exact match first
+    cursor.execute("""
+        SELECT id, title, avg_rating FROM movies 
+        WHERE clean_title = ? 
+        ORDER BY avg_rating DESC LIMIT 1
+    """, (title_clean,))
+    
+    result = cursor.fetchone()
+    if result:
+        return [(result['id'], result['title'], result['avg_rating'])]
+    
+    # Partial match
+    cursor.execute("""
+        SELECT id, title, avg_rating FROM movies 
+        WHERE clean_title LIKE ? 
+        ORDER BY avg_rating DESC LIMIT 5
+    """, (f'%{title_clean}%',))
+    
+    results = cursor.fetchall()
+    return [(row['id'], row['title'], row['avg_rating']) for row in results]
+
+def get_movie_details(movie_ids):
+    """Get detailed movie information"""
+    if not movie_ids:
+        return []
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    placeholders = ','.join(['?'] * len(movie_ids))
+    query = f"""
+        SELECT * FROM movies 
+        WHERE id IN ({placeholders})
+        ORDER BY avg_rating DESC
+    """
+    
+    cursor.execute(query, movie_ids)
+    results = cursor.fetchall()
+    
+    movies = []
+    for row in results:
+        movie = {
+            'id': row['id'],
+            'title': row['title'],
             'type': row['type'],
-            'genres': row['listed_in'] if pd.notna(row['listed_in']) else row.get('ml_genres', '').replace('|', ', '),
-            'description': str(row['description'])[:200] + '...' if pd.notna(row['description']) and len(str(row['description'])) > 200 else str(row['description']) if pd.notna(row['description']) else 'No description available.',
-            'release_year': str(int(row['release_year'])) if pd.notna(row['release_year']) else 'Unknown',
-            'director': str(row['director']) if pd.notna(row['director']) and row['director'] else 'Unknown',
-            'cast': str(row['cast']) if pd.notna(row['cast']) and row['cast'] else 'Unknown',
-            'similarity_score': float(sim_scores[idx]),
-            'avg_rating': float(row.get('avg_rating', 0)),
-            'rating_count': rating_count,
-            'source': row.get('source', 'Netflix'),
-            'data_quality': 'verified' if row.get('data_source') in ['hybrid', 'movielens_only'] else 'estimated'
+            'genres': row['genres'] if row['genres'] else (row['ml_genres'] or '').replace('|', ', '),
+            'description': row['description'][:200] + '...' if row['description'] and len(row['description']) > 200 else row['description'] or 'No description available.',
+            'release_year': str(row['release_year']) if row['release_year'] else 'Unknown',
+            'director': row['director'] or 'Unknown',
+            'cast': row['cast'] or 'Unknown',
+            'avg_rating': float(row['avg_rating']),
+            'rating_count': row['rating_count'] or 0,
+            'source': row['source'] or 'Netflix',
+            'data_quality': row['data_quality'] or 'estimated'
         }
         
-        # Add MovieLens-specific data if available
-        if pd.notna(row.get('ml_rating_std')):
-            rec['rating_consistency'] = f"±{float(row['ml_rating_std']):.1f}"
+        # Add MovieLens specific data if available
+        if row['ml_avg_rating']:
+            movie['ml_rating'] = float(row['ml_avg_rating'])
+        if row['ml_rating_count']:
+            movie['ml_rating_count'] = int(row['ml_rating_count'])
+        if row['ml_rating_std']:
+            movie['rating_consistency'] = f"±{float(row['ml_rating_std']):.1f}"
         
-        if row.get('ml_tags') and pd.notna(row.get('ml_tags')):
-            rec['tags'] = str(row['ml_tags'])[:100]  # Limit tag length
-        
-        recommendations.append(rec)
+        movies.append(movie)
     
-    return recommendations
+    return movies
+
+def get_similar_movies_from_db(movie_ids, limit=50):
+    """Get similar movies using precomputed similarities"""
+    if not movie_ids:
+        return []
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Get similar movies from precomputed similarities
+    placeholders = ','.join(['?'] * len(movie_ids))
+    query = f"""
+        SELECT movie_id_2 as similar_id, AVG(similarity_score) as avg_similarity
+        FROM similarities 
+        WHERE movie_id_1 IN ({placeholders})
+        AND movie_id_2 NOT IN ({placeholders})
+        GROUP BY movie_id_2
+        ORDER BY avg_similarity DESC
+        LIMIT ?
+    """
+    
+    params = movie_ids + movie_ids + [limit]
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    
+    if results:
+        similar_ids = [(row['similar_id'], row['avg_similarity']) for row in results]
+        return similar_ids
+    
+    return []
+
+def get_popular_recommendations(category='overall', limit=20):
+    """Get popular movies from cache"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT movie_ids FROM popular_cache WHERE category = ?", (category,))
+    result = cursor.fetchone()
+    
+    if result:
+        movie_ids = json.loads(result['movie_ids'])[:limit]
+        return movie_ids
+    
+    # Fallback to database query
+    cursor.execute("""
+        SELECT id FROM movies 
+        ORDER BY avg_rating DESC 
+        LIMIT ?
+    """, (limit,))
+    
+    return [row['id'] for row in cursor.fetchall()]
+
+def get_content_based_recommendations(movie_ids, limit=30):
+    """Get recommendations based on genres, themes, etc."""
+    if not movie_ids:
+        return []
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Get user's preferred genres and attributes
+    placeholders = ','.join(['?'] * len(movie_ids))
+    query = f"""
+        SELECT genres, ml_genres, content_themes, type, data_source
+        FROM movies WHERE id IN ({placeholders})
+    """
+    cursor.execute(query, movie_ids)
+    user_movies = cursor.fetchall()
+    
+    # Extract preferences
+    all_genres = set()
+    preferred_type = None
+    preferred_source = None
+    type_counts = {}
+    source_counts = {}
+    
+    for movie in user_movies:
+        # Extract genres
+        genres = (movie['genres'] or '').split(', ') + (movie['ml_genres'] or '').split('|')
+        all_genres.update(g.strip().lower() for g in genres if g.strip())
+        
+        # Count types and sources
+        movie_type = movie['type']
+        if movie_type:
+            type_counts[movie_type] = type_counts.get(movie_type, 0) + 1
+        
+        source = movie['data_source']
+        if source:
+            source_counts[source] = source_counts.get(source, 0) + 1
+    
+    preferred_type = max(type_counts.items(), key=lambda x: x[1])[0] if type_counts else None
+    preferred_source = max(source_counts.items(), key=lambda x: x[1])[0] if source_counts else None
+    
+    # Build recommendation query
+    where_conditions = []
+    params = []
+    
+    if all_genres:
+        # Match at least one genre
+        genre_conditions = []
+        for genre in list(all_genres)[:5]:  # Limit to top 5 genres
+            genre_conditions.append("(genres LIKE ? OR ml_genres LIKE ?)")
+            params.extend([f'%{genre}%', f'%{genre}%'])
+        
+        if genre_conditions:
+            where_conditions.append(f"({' OR '.join(genre_conditions)})")
+    
+    if preferred_type:
+        where_conditions.append("type = ?")
+        params.append(preferred_type)
+    
+    # Exclude user's movies
+    where_conditions.append(f"id NOT IN ({placeholders})")
+    params.extend(movie_ids)
+    
+    # Build final query
+    where_clause = ' AND '.join(where_conditions) if where_conditions else '1=1'
+    
+    query = f"""
+        SELECT id, avg_rating FROM movies 
+        WHERE {where_clause}
+        ORDER BY avg_rating DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    
+    return [(row['id'], row['avg_rating']) for row in results]
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
+    """Super fast recommendation endpoint using database"""
     try:
         data = request.json
         user_titles = data.get('titles', [])
-        top_n = min(data.get('top_n', 10), 20)  # Increased max to 20
+        top_n = min(data.get('top_n', 10), 20)
         
         if not user_titles:
             return jsonify({
@@ -310,164 +281,98 @@ def recommend():
                 'message': 'Please provide at least one movie/show title.'
             })
         
-        # Enhanced title matching across all sources
-        user_indices = []
+        start_time = time.time()
+        
+        # Find user movies
+        user_movie_ids = []
         found_titles = []
         
         for title in user_titles:
-            title_clean = title.lower().strip()
-            
-            # Exact match across all sources
-            exact = df[df['title'].str.lower() == title_clean]
-            if not exact.empty:
-                # Prioritize: MovieLens-only > Hybrid > Netflix-only (for data quality)
-                if any(exact['data_source'] == 'movielens_only'):
-                    best_match = exact[exact['data_source'] == 'movielens_only'].iloc[0]
-                elif any(exact['data_source'] == 'hybrid'):
-                    best_match = exact[exact['data_source'] == 'hybrid'].iloc[0]
-                else:
-                    best_match = exact.iloc[0]
-                user_indices.append(best_match.name)
-                found_titles.append(best_match['title'])
-                continue
-            
-            # Partial match across all sources
-            partial = df[df['title'].str.lower().str.contains(title_clean, na=False)]
-            if not partial.empty:
-                # Prioritize by data quality and rating
-                if any(partial['data_source'] == 'movielens_only'):
-                    ml_matches = partial[partial['data_source'] == 'movielens_only']
-                    best_idx = ml_matches.loc[ml_matches['avg_rating'].idxmax()].name
-                elif any(partial['data_source'] == 'hybrid'):
-                    hybrid_matches = partial[partial['data_source'] == 'hybrid']
-                    best_idx = hybrid_matches.loc[hybrid_matches['avg_rating'].idxmax()].name
-                else:
-                    best_idx = partial.loc[partial['avg_rating'].idxmax()].name
-                user_indices.append(best_idx)
-                found_titles.append(df.loc[best_idx, 'title'])
-                continue
+            matches = search_movies_by_title(title)
+            if matches:
+                best_match = matches[0]  # Highest rated match
+                user_movie_ids.append(best_match[0])
+                found_titles.append(best_match[1])
         
-        if not user_indices:
-            # Enhanced fallback with true source diversity
-            print("No matches found, using diverse fallback...")
-            
-            # Get top titles from each source
-            netflix_top = df[df['data_source'] == 'netflix_only'].nlargest(top_n//3, 'avg_rating')
-            hybrid_top = df[df['data_source'] == 'hybrid'].nlargest(top_n//3, 'avg_rating') 
-            ml_top = df[df['data_source'] == 'movielens_only'].nlargest(top_n//3, 'avg_rating')
-            
-            popular = pd.concat([ml_top, hybrid_top, netflix_top]).head(top_n)
-            
-            fallback = []
-            for _, row in popular.iterrows():
-                # Safe integer conversion for rating_count
-                ml_count = row.get('ml_rating_count', np.nan)
-                regular_count = row.get('rating_count', np.nan)
-                
-                if pd.notna(ml_count):
-                    rating_count = int(ml_count)
-                elif pd.notna(regular_count):
-                    rating_count = int(regular_count)
-                else:
-                    rating_count = 0
-                
-                fallback.append({
-                    'title': row['title'],
-                    'type': row['type'],
-                    'genres': row['listed_in'] if pd.notna(row['listed_in']) else row.get('ml_genres', '').replace('|', ', '),
-                    'description': str(row['description'])[:200] + '...' if pd.notna(row['description']) and len(str(row['description'])) > 200 else str(row['description']) if pd.notna(row['description']) else 'No description available.',
-                    'release_year': str(int(row['release_year'])) if pd.notna(row['release_year']) else 'Unknown',
-                    'director': str(row['director']) if pd.notna(row['director']) and row['director'] else 'Unknown',
-                    'cast': str(row['cast']) if pd.notna(row['cast']) and row['cast'] else 'Unknown',
-                    'avg_rating': float(row.get('avg_rating', 0)),
-                    'rating_count': rating_count,
-                    'source': row.get('source', 'Netflix'),
-                    'data_quality': 'verified' if row.get('data_source') in ['hybrid', 'movielens_only'] else 'estimated'
-                })
+        if not user_movie_ids:
+            logger.info("No matches found, using popular fallback")
+            popular_ids = get_popular_recommendations('overall', top_n)
+            recommendations = get_movie_details(popular_ids)
             
             return jsonify({
-                'recommendations': fallback,
-                'message': 'No exact matches found. Here are top-rated suggestions from all sources.',
+                'recommendations': recommendations,
+                'message': 'No exact matches found. Here are popular suggestions.',
                 'found_titles': [],
-                'sources_used': ['Netflix', 'MovieLens', 'Hybrid'],
-                'recommendation_quality': 'diverse_fallback'
+                'processing_time': round(time.time() - start_time, 3)
             })
         
-        # Generate hybrid recommendations
-        user_vectors = features[user_indices].toarray()
-        user_vector = np.mean(user_vectors, axis=0).reshape(1, -1)
+        # Get recommendations from multiple sources
+        similar_movies = []
         
-        sim_scores = compute_hybrid_similarity(user_vector, features, df, user_indices)
-        recommendations = filter_universal_recommendations(df, sim_scores, user_indices, user_titles, top_n)
+        # 1. Precomputed similarities (60% of results)
+        similarity_results = get_similar_movies_from_db(user_movie_ids, top_n)
+        similar_ids_with_scores = similarity_results[:int(top_n * 0.6)]
         
-        # Extract user's main preferences for context
-        user_genres = []
-        user_sources = []
-        for idx in user_indices:
-            row = df.iloc[idx]
-            genres = str(row['listed_in']).split(',') + str(row.get('ml_genres', '')).split('|')
-            user_genres.extend([g.strip() for g in genres if g.strip()])
-            user_sources.append(row.get('source', 'Netflix'))
+        # 2. Content-based recommendations (40% of results)
+        content_results = get_content_based_recommendations(user_movie_ids, top_n)
+        content_ids_with_scores = content_results[:int(top_n * 0.4)]
         
-        main_genre = max(set(user_genres), key=user_genres.count) if user_genres else 'Mixed'
-        main_source = max(set(user_sources), key=user_sources.count) if user_sources else 'Netflix'
+        # Combine and deduplicate
+        all_recommendations = {}
         
-        # Analyze recommendation sources
-        rec_sources = {}
-        for rec in recommendations:
-            source = rec['source']
-            rec_sources[source] = rec_sources.get(source, 0) + 1
+        # Add similarity-based recommendations
+        for movie_id, score in similar_ids_with_scores:
+            all_recommendations[movie_id] = score
         
-        verified_recs = sum(1 for rec in recommendations if rec['data_quality'] == 'verified')
+        # Add content-based recommendations (with lower weight)
+        for movie_id, rating in content_ids_with_scores:
+            if movie_id not in all_recommendations:
+                all_recommendations[movie_id] = rating * 0.2  # Lower weight for content-based
+        
+        # Sort by score and get top N
+        sorted_recommendations = sorted(all_recommendations.items(), 
+                                      key=lambda x: x[1], reverse=True)[:top_n]
+        
+        final_movie_ids = [movie_id for movie_id, _ in sorted_recommendations]
+        
+        # If we don't have enough recommendations, fill with popular ones
+        if len(final_movie_ids) < top_n:
+            popular_ids = get_popular_recommendations('overall', top_n - len(final_movie_ids))
+            # Add popular movies that aren't already in recommendations
+            for pop_id in popular_ids:
+                if pop_id not in final_movie_ids and pop_id not in user_movie_ids:
+                    final_movie_ids.append(pop_id)
+                if len(final_movie_ids) >= top_n:
+                    break
+        
+        # Get detailed movie information
+        recommendations = get_movie_details(final_movie_ids)
+        
+        processing_time = time.time() - start_time
         
         return jsonify({
-            'recommendations': recommendations,
+            'recommendations': recommendations[:top_n],
             'found_titles': found_titles,
-            'message': f'Found {len(found_titles)} titles. Generated {len(recommendations)} recommendations ({verified_recs} with verified ratings).',
-            'user_main_genre': main_genre,
-            'user_main_source': main_source,
-            'recommendation_sources': rec_sources,
-            'recommendation_quality': 'hybrid_enhanced'
+            'message': f'Found {len(found_titles)} titles. Generated {len(recommendations)} recommendations.',
+            'processing_time': round(processing_time, 3),
+            'recommendation_sources': {
+                'similarity_based': len(similar_ids_with_scores),
+                'content_based': len(content_ids_with_scores),
+                'popular_fallback': max(0, top_n - len(similar_ids_with_scores) - len(content_ids_with_scores))
+            }
         })
         
     except Exception as e:
-        print(f"Error in recommendation: {str(e)}")
+        logger.error(f"Error in recommendation: {str(e)}")
         return jsonify({
             'error': str(e),
             'recommendations': [],
             'message': 'Error generating recommendations.'
         }), 500
 
-def compute_universal_similarity(user_vector, features, df, user_indices):
-    """Maintain backward compatibility"""
-    return compute_hybrid_similarity(user_vector, features, df, user_indices)
-
-@app.route('/health', methods=['GET'])
-def health():
-    # Enhanced health check with source breakdown
-    source_stats = {}
-    if 'data_source' in df.columns:
-        for source in df['data_source'].unique():
-            count = len(df[df['data_source'] == source])
-            avg_rating = df[df['data_source'] == source]['avg_rating'].mean()
-            source_stats[source] = {
-                'count': count,
-                'avg_rating': round(avg_rating, 2)
-            }
-    
-    return jsonify({
-        'status': 'healthy',
-        'total_titles': len(df),
-        'model_type': 'true_hybrid_netflix_movielens',
-        'avg_rating_range': f"{df['avg_rating'].min():.1f} - {df['avg_rating'].max():.1f}",
-        'source_breakdown': source_stats,
-        'sources_available': list(df.get('source', pd.Series(['Netflix'])).unique()),
-        'features_count': features.shape[1] if 'features' in globals() else 'unknown'
-    })
-
 @app.route('/search', methods=['POST'])
 def search_titles():
-    """New endpoint to search across all sources"""
+    """Fast search endpoint"""
     try:
         data = request.json
         query = data.get('query', '').lower().strip()
@@ -479,52 +384,101 @@ def search_titles():
                 'message': 'Please provide a search query.'
             })
         
-        # Search across titles, descriptions, genres, and tags
-        search_mask = (
-            df['title'].str.lower().str.contains(query, na=False) |
-            df['description'].str.lower().str.contains(query, na=False) |
-            df['listed_in'].str.lower().str.contains(query, na=False) |
-            df.get('ml_genres', pd.Series([''] * len(df))).str.lower().str.contains(query, na=False) |
-            df.get('ml_tags', pd.Series([''] * len(df))).str.lower().str.contains(query, na=False)
-        )
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        search_results = df[search_mask].nlargest(limit, 'avg_rating')
+        # Search in title, genres, and description
+        search_query = f'%{query}%'
+        cursor.execute("""
+            SELECT id FROM movies 
+            WHERE clean_title LIKE ? 
+            OR genres LIKE ? 
+            OR ml_genres LIKE ?
+            OR LOWER(description) LIKE ?
+            ORDER BY avg_rating DESC
+            LIMIT ?
+        """, (search_query, search_query, search_query, search_query, limit))
         
-        results = []
-        for _, row in search_results.iterrows():
-            results.append({
-                'title': row['title'],
-                'type': row['type'],
-                'genres': row['listed_in'] if pd.notna(row['listed_in']) else row.get('ml_genres', '').replace('|', ', '),
-                'description': str(row['description'])[:150] + '...' if pd.notna(row['description']) and len(str(row['description'])) > 150 else str(row['description']) if pd.notna(row['description']) else 'No description available.',
-                'release_year': str(int(row['release_year'])) if pd.notna(row['release_year']) else 'Unknown',
-                'avg_rating': float(row.get('avg_rating', 0)),
-                'rating_count': int(row.get('ml_rating_count', row.get('rating_count', 0))),
-                'source': row.get('source', 'Netflix'),
-                'data_quality': 'verified' if row.get('data_source') in ['hybrid', 'movielens_only'] else 'estimated'
-            })
-        
-        # Source breakdown for search results
-        source_breakdown = {}
-        for result in results:
-            source = result['source']
-            source_breakdown[source] = source_breakdown.get(source, 0) + 1
+        movie_ids = [row['id'] for row in cursor.fetchall()]
+        results = get_movie_details(movie_ids)
         
         return jsonify({
             'results': results,
-            'total_found': len(search_results),
-            'query': query,
-            'source_breakdown': source_breakdown,
-            'message': f'Found {len(results)} titles matching "{query}"'
+            'total_found': len(results),
+            'query': query
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in search: {str(e)}")
+        return jsonify({
+            'error': str(e),
+            'results': []
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check with database stats"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM movies")
+        total_movies = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM similarities")
+        total_similarities = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(DISTINCT source) FROM movies")
+        total_sources = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT AVG(avg_rating) FROM movies")
+        avg_rating = cursor.fetchone()[0]
+        
+        return jsonify({
+            'status': 'healthy',
+            'database_type': 'sqlite',
+            'total_movies': total_movies,
+            'precomputed_similarities': total_similarities,
+            'data_sources': total_sources,
+            'avg_rating': round(avg_rating, 2) if avg_rating else 0,
+            'vectorizer_loaded': vectorizer is not None
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/popular/<category>', methods=['GET'])
+def get_popular(category):
+    """Get popular movies by category"""
+    try:
+        limit = min(int(request.args.get('limit', 20)), 50)
+        
+        popular_ids = get_popular_recommendations(category, limit)
+        recommendations = get_movie_details(popular_ids)
+        
+        return jsonify({
+            'category': category,
+            'recommendations': recommendations,
+            'count': len(recommendations)
         })
         
     except Exception as e:
         return jsonify({
             'error': str(e),
-            'results': [],
-            'message': 'Error searching titles.'
+            'recommendations': []
         }), 500
+
+# Initialize on startup
+try:
+    check_database()
+    load_vectorizer()
+    logger.info("Database-powered recommendation system ready!")
+except Exception as e:
+    logger.error(f"Startup error: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
