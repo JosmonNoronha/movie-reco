@@ -23,9 +23,7 @@ model_cache_optimized.pkl
 
 
 # Data files (large datasets)
-netflix_titles.csv   
-ml-latest-small/  
-*.csv 
+ 
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
